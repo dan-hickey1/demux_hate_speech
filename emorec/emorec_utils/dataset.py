@@ -1366,8 +1366,8 @@ class MHSAnnotators(EmotionDatasetAdditionalFeatures, ABC):
     emotion_order = None
 
     _emotions = ['negative', 'disrespectful', 'insult',
-                'humiliation', 'superior', 'dehumanizing',
-                'violent', 'genocidal', 'hatespeech', 'counterspeech', 'race', 'jewish',
+                'humiliation', 'attack', 'superior', 'dehumanizing',
+                'violent', 'genocidal', 'hatespeech', 'race', 'jewish',
                 'muslim', 'religion', 'origin', 'gender', 'women',
                 'transgender', 'transman', 'transwoman',
                 'non-binary', 'sexuality', 'disability']
