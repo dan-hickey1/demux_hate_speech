@@ -331,7 +331,7 @@ def main():
             print("\n", f"Rep {rep+1}", "\n")
 
         experiment_handler = ExperimentHandler(
-            "./experiment_logs", f"BaseModel{task}_{platform}_{outputs}_eval_reddit", description=description
+            "./experiment_logs", f"BaseModel{task}_{platform}", description=description
         )
 
         args = experiment_handler.set_namespace_params(args)
