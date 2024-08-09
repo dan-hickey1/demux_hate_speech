@@ -3,7 +3,7 @@ This repository contains code adapted from the Demux-MEmo library (https://githu
 #### Instructions for use
 
 To train a model, run:
-`python3 experiments/demux.py MHS --model_name bert-base-uncased --root_dir {root_dir} --train_split train --dev_split dev --model_save --max_length 512 --early_stopping_patience 5 --correct_bias --num_train_epochs 20 --dropout_prob 0.1  --device cuda --reps {reps} --platform reddit`
+`python3 experiments/demux.py MHS --model_name bert-base-uncased --root_dir {root_dir} --train_split train --dev_split dev --model_save --max_length 512 --early_stopping_patience 5 --correct_bias --num_train_epochs 20 --dropout_prob 0.1  --device cuda --reps {reps}`
 
 Arguments:
 - use `--model_save` if you want to save the model
