@@ -10,3 +10,5 @@ Arguments:
 - use `--platform reddit` if you want to train on Reddit data only, otherwise use `--platform all` (default is all)
 - type `MHS` after the Python script name if you want to train using aggregated labels for each post, use `MHSAnnotators` if you want to train using individual annotator labels.
 - to use basic BERT instead of Demux, run `python3 experiments/base_train.py` instead of `experiments/demux.py`
+
+To make inferences about posts using a trained model, run `annotate.py` using the instructions in the Demux repository using `emotion_configs/mhs.json`. If you are using the model trained on annotator labels, use `annotate_annotator_models.py` instead of `annotate.py`. 
