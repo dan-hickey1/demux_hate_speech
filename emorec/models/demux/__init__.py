@@ -1,12 +1,17 @@
-from .model import Memo
+from .model import Demux
+from .annotator_demux import DemuxAnno
 from .dataset import (
-    MemoDatasetForSemEval,
-    MemoMixDatasetForSemEval,
-    MemoDatasetForGoEmotions,
-    MemoDatasetForFrenchElectionEmotionClusters,
+    DemuxDatasetForSemEval,
+    DemuxMixDatasetForSemEval,
+    DemuxDatasetForGoEmotions,
+    DemuxDatasetForFrenchElectionEmotionClusters,
+    DemuxDatasetForMHS,
+    DemuxDatasetForAnnotators
 )
 from .trainer import (
-    MemoTrainerForSemEval,
-    MemoTrainerForGoEmotions,
-    MemoTrainerForFrenchElectionEmotionClusters,
+    DemuxTrainerForSemEval,
+    DemuxTrainerForGoEmotions,
+    DemuxTrainerForFrenchElectionEmotionClusters,
+    DemuxTrainerForMHS,
+    DemuxTrainerForAnnotators
 )

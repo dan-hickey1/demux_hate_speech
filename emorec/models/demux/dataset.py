@@ -1,78 +1,150 @@
-## Author: Gireesh Mahajan
-
 from typing import List, Optional, Dict, Any, Callable, Union
-from transformers import PreTrainedTokenizerBase
-
-import torch
-
 from copy import deepcopy
 
+import torch
+from transformers import PreTrainedTokenizerBase
+
 from emorec.emorec_utils.dataset import (
-    GoEmotionsDataset,
     SemEval2018Task1EcDataset,
     SemEval2018Task1EcMixDataset,
+    GoEmotionsDataset,
     FrenchElectionEmotionClusterDataset,
+    #PaletzDataset,
+    MeasuringHateSpeechDataset,
+    MHSAnnotators
 )
+from emorec.utils import flatten_list
 
 
-class MemoDatasetMixin:
-    """General Memo dataset class (agnostic to specific dataset).
+class DemuxDatasetMixin:
+    """General Demux dataset class (agnostic to specific dataset).
 
     Attributes:
         argparse_args: dictionary with argparse arguments and parser values.
-        prompt: memo classification prompt, must include '{{}}' to insert sample text and
-        '{kind_of_text}' to substitue medium of text (tweet, reddit post, etc.).
-        The text to substitute can be modified via the `prompt_kwargs` argument.
+        prompt: Demux classification prompt.
+        class_inds: indices of tokens for each emotion.
     """
 
     argparse_args = dict(
+        prompt_delimiter=dict(
+            default=" ",
+            type=str,
+            help="what to use to separate the emotion words in the prompt",
+        ),
         max_length=dict(
             default=64,
             type=int,
             help="Max total tokenized length of prompt and text",
         ),
-        prompt=dict(
-            default="The {kind_of_text} {{}}",
-            type=str,
-            help="The initial portion of the prompt that denotes the kind of text and a "
-            "location for the text to classify, must be a format string that includes "
-            "'{kind_of_text}' and '{{}}' for the text to classify",
-        ),
     )
 
     def __init__(
         self,
-        tokenizer: PreTrainedTokenizerBase,
-        prompt: str = "The {kind_of_text} {{}}",
-        prompt_kwargs: Dict[str, Any] = {"kind_of_text": "tweet"},
-        **kwargs,
+        prompt_delimiter: str = " ",
+        **kwargs,  # cooperative inheritance
     ):
         """Init.
-        Substitutes the `{{}}` in the prompt with the text to classify and
-        substitutes any additional format arguments if they appear in prompt_kwargs.
 
         Args:
             See `SemEval2018Task1EcDataset`.
             max_length: max sequence length (including prompt).
-            prompt: memo classification prompt, must include '{{}}' to insert sample text and
-                '{kind_of_text}' to substitue medium of text (tweet, reddit post, etc.).
-            prompt_kwargs: Additional text to substitute. Default is `{"kind_of_text": "tweet"}`.
+            prompt_delimiter: string to use to separate emotions
+                in prompt.
         """
 
-        prompt_kwargs.update({"mask_token": tokenizer.mask_token})
-        self.prompt = prompt.format(**prompt_kwargs)
-        self.mask_token_count = self.prompt.count(tokenizer.mask_token)
-        super().__init__(
-            tokenizer=tokenizer,
-            **kwargs,
+        emotions_for_prompt = flatten_list(self.emotions)  # for clusters
+
+        self.prompt = (
+            prompt_delimiter.join(emotions_for_prompt[:-1])
+            + " "
+            + self.disjunction
+            + " "
+            + emotions_for_prompt[-1]
         )
 
+        super().__init__(**kwargs)
+
+        self.class_inds = self.get_class_inds()
+        self.all_class_ids = self.get_class_ids(self.all_emotions)
+
+    @property
+    def disjunction(self):
+        return "or"
+
+    def get_class_ids(self, classes):
+        return [
+            self.tokenizer.convert_tokens_to_ids(
+                self.tokenizer.tokenize(emotion_cls)
+            )
+            if isinstance(emotion_cls, str)
+            # else cluster of emotions
+            else [
+                self.tokenizer.convert_tokens_to_ids(
+                    self.tokenizer.tokenize(emotion)
+                )
+                for emotion in emotion_cls
+            ]
+            for emotion_cls in classes
+        ]
+
+    def get_class_inds(
+        self, example_input_ids: Optional[List[int]] = None
+    ) -> List[torch.Tensor]:
+        """Get indices of tokens for each emotion.
+
+        Args:
+            example_input_ids: specify different tokenized sequence
+                to grab class indices from (or use before initialization).
+
+        Returns:
+            A list of tensors, each containing all the indices
+            for a specific emotion (in the order of `self.emotions`).
+        """
+
+        class_ids = self.get_class_ids(self.emotions)
+
+        # NOTE: prompt SHOULD be the same in all examples
+        if example_input_ids is None:
+            if isinstance(self.inputs, list) or isinstance(self.inputs, tuple):
+                example_input_ids = self.inputs[0]["input_ids"][0].tolist()
+            else:
+                example_input_ids = self.inputs["input_ids"][0].tolist()
+
+        class_inds = []
+        for ids in class_ids:
+            inds = []
+            if isinstance(ids[0], list):  # if cluster
+                for emo_ids in ids:
+                    emo_inds = []
+                    for _id in emo_ids:
+                        id_idx = example_input_ids.index(_id)
+                        # in case it exists multiple times, turn identified instance
+                        # to None (i.e. pop w/o changing indices because indices are
+                        # what we are collecting)
+                        example_input_ids[id_idx] = None
+                        emo_inds.append(id_idx)
+                    inds.append(torch.tensor(emo_inds, dtype=torch.long))
+                class_inds.append(inds)
+            else:  # if individual emotions
+                for _id in ids:
+                    id_idx = example_input_ids.index(_id)
+                    # in case it exists multiple times, turn identified instance
+                    # to None (i.e. pop w/o changing indices because indices are
+                    # what we are collecting)
+                    example_input_ids[id_idx] = None
+                    inds.append(id_idx)
+
+                class_inds.append(torch.tensor(inds, dtype=torch.long))
+
+        return class_inds
+
     def encode_plus(
-        self, texts: List[str], max_length: int
+        self, texts: Union[List[str], List[List[str]]], max_length: int
     ) -> Dict[str, torch.Tensor]:
-        """Tokenizes input texts by using the `self.prompt` as a template.
-        Truncation always happens from the right side since the prompt is
-        always assumed to end with the text.
+        """Tokenizes input texts by using the `self.prompt` as
+        the first sequence of the input, the text as the second.
+        Truncation always happens from the text because prompt
+        is used to classify.
 
         Args:
             texts: input tweets.
@@ -83,52 +155,46 @@ class MemoDatasetMixin:
         """
 
         if isinstance(texts[0], list):
-
-            print(
-                "sample prompt: ",
-                self.prompt.format(self.text_preprocessor(texts[0][0])),
-            )
-
             return [
                 self.tokenizer.batch_encode_plus(
                     [
-                        (self.prompt.format(self.text_preprocessor(text)))
+                        (self.prompt, self.text_preprocessor(text))
                         for text in lang_texts
                     ],
                     max_length=max_length,
-                    truncation=True,
+                    truncation="only_second",
                     padding="max_length",
                     return_tensors="pt",
                 )
                 for lang_texts in texts
             ]
 
-        print(
-            "sample prompt: ",
-            self.prompt.format(self.text_preprocessor(texts[0])),
-        )
-
-        inputs = self.tokenizer.batch_encode_plus(
-            [
-                self.prompt.format(self.text_preprocessor(text))
-                for text in texts
-            ],
+        return self.tokenizer.batch_encode_plus(
+            [(self.prompt, self.text_preprocessor(text)) for text in texts],
             max_length=max_length,
+            truncation="only_second",
             padding="max_length",
             return_tensors="pt",
-            truncation=True,
         )
 
-        return inputs
 
+class DemuxDatasetForSemEval(DemuxDatasetMixin, SemEval2018Task1EcDataset):
+    """Demux dataset for SemEval 2018 Task 1 E-c. For everything,
+    check either `SemEval2018Task1EcDataset` or `DemuxDatasetMixin`.
 
-class MemoDatasetForSemEval(MemoDatasetMixin, SemEval2018Task1EcDataset):
-    """Memo dataset for SemEval 2018 Task 1 E-c. For everything,
-    check either `SemEval2018Task1EcDataset` or `MemoDatasetMixin`.
+    Attributes:
+        or_per_language: disjunctions for all languages.
     """
 
+    or_per_language = {
+        "english": "or",
+        "french": "ou",
+        "spanish": "o",
+        "arabic": "أو",
+    }
+
     argparse_args = deepcopy(SemEval2018Task1EcDataset.argparse_args)
-    argparse_args.update(MemoDatasetMixin.argparse_args)
+    argparse_args.update(DemuxDatasetMixin.argparse_args)
 
     def __init__(
         self,
@@ -137,13 +203,18 @@ class MemoDatasetForSemEval(MemoDatasetMixin, SemEval2018Task1EcDataset):
         tokenizer: PreTrainedTokenizerBase,
         max_length: int,
         language: str,
+        model_language: Optional[str] = None,
+        excluded_emotions: Optional[List[str]] = None,
+        logging_level: Optional[int] = None,
+        prompt_delimiter: str = " ",
         twitter_preprocessor: Optional[Callable] = None,
         demojizer: Optional[Callable] = None,
-        model_language: Optional[str] = None,
-        logging_level: Optional[int] = None,
-        prompt: str = "The {kind_of_text} {{}}",
-        prompt_kwargs: Dict[str, Any] = {"kind_of_text": "tweet"},
     ):
+        """Init.
+
+        Args:
+            See `DemuxDatasetMixin`, `SemEval2018Task1EcDataset`.
+        """
 
         self.language = language
         if not isinstance(language, list):
@@ -158,26 +229,42 @@ class MemoDatasetForSemEval(MemoDatasetMixin, SemEval2018Task1EcDataset):
                 model_language = "Multilingual"
         self.model_language = model_language
 
+        self.excluded_emotions = excluded_emotions or []
         super().__init__(
             root_dir=root_dir,
             splits=splits,
             tokenizer=tokenizer,
             encode_kwargs={"max_length": max_length},
             logging_level=logging_level,
-            prompt=prompt,
-            prompt_kwargs=prompt_kwargs,
-            # to pass these to SemEval2018Task1EcDataset, else None
+            prompt_delimiter=prompt_delimiter,
+            excluded_emotions=excluded_emotions,
             language=language,
             model_language=model_language,
             twitter_preprocessor=twitter_preprocessor,
             demojizer=demojizer,
         )
 
+    @property
+    def disjunction(self):
+        """Disjunctions for all SemEval languages."""
 
-class MemoMixDatasetForSemEval(MemoDatasetMixin, SemEval2018Task1EcMixDataset):
+        return self.or_per_language.get(
+            self.model_language.lower(), self.or_per_language["english"]
+        )
+
+
+class DemuxMixDatasetForSemEval(
+    DemuxDatasetMixin, SemEval2018Task1EcMixDataset
+):
+    or_per_language = {
+        "english": "or",
+        "french": "ou",
+        "spanish": "o",
+        "arabic": "أو",
+    }
 
     argparse_args = deepcopy(SemEval2018Task1EcMixDataset.argparse_args)
-    argparse_args.update(MemoDatasetMixin.argparse_args)
+    argparse_args.update(DemuxDatasetMixin.argparse_args)
 
     def __init__(
         self,
@@ -187,14 +274,13 @@ class MemoMixDatasetForSemEval(MemoDatasetMixin, SemEval2018Task1EcMixDataset):
         max_length: int,
         alpha: float,
         language: str,
+        model_language: Optional[str] = None,
+        excluded_emotions: Optional[List[str]] = None,
+        logging_level: Optional[int] = None,
+        prompt_delimiter: str = " ",
         twitter_preprocessor: Optional[Callable] = None,
         demojizer: Optional[Callable] = None,
-        model_language: Optional[str] = None,
-        logging_level: Optional[int] = None,
-        prompt: str = "The {kind_of_text} {{}}",
-        prompt_kwargs: Dict[str, Any] = {"kind_of_text": "tweet"},
     ):
-
         self.language = language
         if not isinstance(language, list):
             self.language = [language]
@@ -208,6 +294,8 @@ class MemoMixDatasetForSemEval(MemoDatasetMixin, SemEval2018Task1EcMixDataset):
                 model_language = "Multilingual"
         self.model_language = model_language
 
+        self.excluded_emotions = excluded_emotions or []
+
         super().__init__(
             root_dir=root_dir,
             splits=splits,
@@ -215,23 +303,29 @@ class MemoMixDatasetForSemEval(MemoDatasetMixin, SemEval2018Task1EcMixDataset):
             alpha=alpha,
             encode_kwargs={"max_length": max_length},
             logging_level=logging_level,
-            prompt=prompt,
-            prompt_kwargs=prompt_kwargs,
-            # to pass these to SemEval2018Task1EcDataset, else None
+            prompt_delimiter=prompt_delimiter,
+            excluded_emotions=excluded_emotions,
             language=language,
             model_language=model_language,
             twitter_preprocessor=twitter_preprocessor,
             demojizer=demojizer,
         )
 
+    @property
+    def disjunction(self):
+        """Disjunctions for all SemEval languages."""
 
-class MemoDatasetForGoEmotions(MemoDatasetMixin, GoEmotionsDataset):
-    """Memo dataset for Go Emotions. For everything,
-    check either `GoEmotionsDataset` or `MemoDatasetMixin`.
-    """
+        return self.or_per_language.get(
+            self.model_language.lower(), self.or_per_language["english"]
+        )
+
+
+class DemuxDatasetForGoEmotions(DemuxDatasetMixin, GoEmotionsDataset):
+    """Demux dataset for GoEmotions. For everything, check either
+    `DemuxDatasetMixin` or `GoEmotionsDataset`."""
 
     argparse_args = deepcopy(GoEmotionsDataset.argparse_args)
-    argparse_args.update(MemoDatasetMixin.argparse_args)
+    argparse_args.update(DemuxDatasetMixin.argparse_args)
 
     def __init__(
         self,
@@ -240,13 +334,11 @@ class MemoDatasetForGoEmotions(MemoDatasetMixin, GoEmotionsDataset):
         tokenizer: PreTrainedTokenizerBase,
         max_length: int,
         emotions_filename: Optional[str] = None,
+        prompt_delimiter: str = " ",
         reddit_preprocessor: Optional[Callable] = None,
         demojizer: Optional[Callable] = None,
         logging_level: Optional[int] = None,
-        prompt: str = "The {kind_of_text} {{}}",
-        prompt_kwargs: Dict[str, Any] = {"kind_of_text": "tweet"},
     ):
-
         self.set_emotion_order(emotions_filename)
 
         super().__init__(
@@ -254,26 +346,23 @@ class MemoDatasetForGoEmotions(MemoDatasetMixin, GoEmotionsDataset):
             splits=splits,
             tokenizer=tokenizer,
             encode_kwargs={"max_length": max_length},
-            prompt=prompt,
-            prompt_kwargs=prompt_kwargs,
-            # to pass these to GoEmotionsDataset, else None
             emotions_filename=emotions_filename,
+            prompt_delimiter=prompt_delimiter,
             reddit_preprocessor=reddit_preprocessor,
             demojizer=demojizer,
             logging_level=logging_level,
         )
 
 
-class MemoDatasetForFrenchElectionEmotionClusters(
-    MemoDatasetMixin, FrenchElectionEmotionClusterDataset
+class DemuxDatasetForFrenchElectionEmotionClusters(
+    DemuxDatasetMixin, FrenchElectionEmotionClusterDataset
 ):
-
-    """Memo dataset for French election data. For everything,
-    check either `FrenchElectionEmotionClusterDataset` or `MemoDatasetMixin`.
-    """
+    """Demux dataset for French election data. For everything,
+    check either `FrenchElectionEmotionClusterDataset` or
+    `DemuxDatasetMixin`."""
 
     argparse_args = deepcopy(FrenchElectionEmotionClusterDataset.argparse_args)
-    argparse_args.update(MemoDatasetMixin.argparse_args)
+    argparse_args.update(DemuxDatasetMixin.argparse_args)
 
     def __init__(
         self,
@@ -281,12 +370,19 @@ class MemoDatasetForFrenchElectionEmotionClusters(
         splits: Union[List[str], str],
         tokenizer: PreTrainedTokenizerBase,
         max_length: int,
+        model_language: Optional[bool] = None,
+        logging_level: Optional[int] = None,
+        prompt_delimiter: str = " ",
         twitter_preprocessor: Optional[Callable] = None,
         demojizer: Optional[Callable] = None,
-        logging_level: Optional[int] = None,
-        prompt: str = "The {kind_of_text} {{}}",
-        prompt_kwargs: Dict[str, Any] = {"kind_of_text": "tweet"},
     ):
+        """Init.
+
+        Args:
+            See `DemuxDatasetMixin`, `FrenchElectionEmotionClusterDataset`.
+        """
+
+        self.model_language = model_language or "english"
 
         super().__init__(
             root_dir=root_dir,
@@ -294,9 +390,134 @@ class MemoDatasetForFrenchElectionEmotionClusters(
             tokenizer=tokenizer,
             encode_kwargs={"max_length": max_length},
             logging_level=logging_level,
-            prompt=prompt,
-            prompt_kwargs=prompt_kwargs,
+            prompt_delimiter=prompt_delimiter,
+            model_language=model_language,
             # to pass these to FrenchElectionEmotionClusterDataset, else None
             twitter_preprocessor=twitter_preprocessor,
             demojizer=demojizer,
+        )
+
+'''
+class DemuxDatasetForPaletz(DemuxDatasetMixin, PaletzDataset):
+    """Demux dataset for Paletz. For everything, check either
+    `DemuxDatasetMixin` or `PaletzDataset`."""
+
+    argparse_args = deepcopy(PaletzDataset.argparse_args)
+    argparse_args.update(DemuxDatasetMixin.argparse_args)
+
+    def __init__(
+        self,
+        root_dir: str,
+        splits: Union[List[str], str],
+        tokenizer: PreTrainedTokenizerBase,
+        max_length: int,
+        language: str,
+        round_labels: bool = True,
+        model_language: Optional[str] = None,
+        excluded_emotions: Optional[List[str]] = None,
+        logging_level: Optional[int] = None,
+        prompt_delimiter: str = " ",
+        facebook_preprocessor: Optional[Callable] = None,
+        demojizer: Optional[Callable] = None,
+    ):
+        self.excluded_emotions = excluded_emotions or []
+        super().__init__(
+            root_dir=root_dir,
+            splits=splits,
+            tokenizer=tokenizer,
+            encode_kwargs={"max_length": max_length},
+            logging_level=logging_level,
+            prompt_delimiter=prompt_delimiter,
+            excluded_emotions=excluded_emotions,
+            language=language,
+            model_language=model_language,
+            facebook_preprocessor=facebook_preprocessor,
+            demojizer=demojizer,
+            round_labels=round_labels,
+        )
+
+'''
+class DemuxDatasetForMHS(DemuxDatasetMixin, MeasuringHateSpeechDataset):
+    """Demux dataset for Measuring Hate Speech. For everything, check either
+    `DemuxDatasetMixin` or `MeasuringHateSpeechDataset`."""
+
+    argparse_args = deepcopy(MeasuringHateSpeechDataset.argparse_args)
+    argparse_args.update(DemuxDatasetMixin.argparse_args)
+
+    def __init__(
+        self,
+        root_dir: str,
+        splits: Union[List[str], str],
+        tokenizer: PreTrainedTokenizerBase,
+        max_length: int,
+        model_language: Optional[str] = None,
+        excluded_emotions: Optional[List[str]] = None,
+        logging_level: Optional[int] = None,
+        prompt_delimiter: str = " ",
+        seed: Optional[int] = 42,
+        platform: Optional[str] = 'all',
+        outputs: Optional[str] = 'hate',
+        split_all: Optional[bool] = True,
+        reddit_preprocessor: Optional[Callable] = None,
+        demojizer: Optional[Callable] = None,
+    ):
+        self.excluded_emotions = excluded_emotions or []
+        super().__init__(
+            root_dir=root_dir,
+            splits=splits,
+            tokenizer=tokenizer,
+            encode_kwargs={"max_length": max_length},
+            logging_level=logging_level,
+            prompt_delimiter=prompt_delimiter,
+            excluded_emotions=excluded_emotions,
+            model_language=model_language,
+            seed=seed,
+            platform = platform,
+            outputs = outputs,
+            split_all = split_all,
+
+            reddit_preprocessor=reddit_preprocessor,
+            demojizer=demojizer
+        )
+
+class DemuxDatasetForAnnotators(DemuxDatasetMixin, MHSAnnotators):
+    """Demux dataset for Measuring Hate Speech. For everything, check either
+    `DemuxDatasetMixin` or `MeasuringHateSpeechDataset`."""
+
+    argparse_args = deepcopy(MeasuringHateSpeechDataset.argparse_args)
+    argparse_args.update(DemuxDatasetMixin.argparse_args)
+
+    def __init__(
+        self,
+        root_dir: str,
+        splits: Union[List[str], str],
+        tokenizer: PreTrainedTokenizerBase,
+        max_length: int,
+        model_language: Optional[str] = None,
+        excluded_emotions: Optional[List[str]] = None,
+        logging_level: Optional[int] = None,
+        prompt_delimiter: str = " ",
+        seed: Optional[int] = 42,
+        platform: Optional[str] = 'all',
+        outputs: Optional[str] = 'hate',
+        split_all: Optional[bool] = True,
+        reddit_preprocessor: Optional[Callable] = None,
+        demojizer: Optional[Callable] = None,
+    ):
+        self.excluded_emotions = excluded_emotions or []
+        super().__init__(
+            root_dir=root_dir,
+            splits=splits,
+            tokenizer=tokenizer,
+            encode_kwargs={"max_length": max_length},
+            logging_level=logging_level,
+            prompt_delimiter=prompt_delimiter,
+            excluded_emotions=excluded_emotions,
+            model_language=model_language,
+            seed=seed,
+            platform = platform,
+            outputs = outputs,
+            split_all = split_all,
+            reddit_preprocessor=reddit_preprocessor,
+            demojizer=demojizer
         )
