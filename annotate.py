@@ -14,6 +14,7 @@ from transformers import AutoTokenizer, PreTrainedTokenizerBase
 
 from emorec.utils import flatten_list, twitter_preprocessor, reddit_preprocessor
 from emorec.models.demux.model import Demux
+from emorec.emorec_utils import BaseModel
 from emorec.models.demux.utils import demojizer_selector
 
 Text = Dict[str, str]
@@ -203,6 +204,7 @@ def pipeline_setup(
     model_name: str,
     pretrained_fn: str,
     device: str,
+    model_arch: str,
     platform: str = "Twitter",
 ) -> SimpleNamespace:
     """Returms the `model`, the `tokenizer`, and the text `preprocessor`
@@ -220,7 +222,12 @@ def pipeline_setup(
     platform_preprocessor = PLATFORM_PREPROCESSORS[platform]()
     preprocessor = lambda x: platform_preprocessor(demojizer(x))
 
-    model = Demux.from_pretrained(model_name, class_inds=None)
+    if model_arch == "Demux":
+        model = Demux.from_pretrained(model_name, class_inds=None)
+
+    else:
+        model = BaseModel.from_pretrained(model_name)
+
 
     print(f"Loading model from {pretrained_fn}")
     state_dict = torch.load(pretrained_fn, map_location="cpu")
@@ -291,6 +298,7 @@ def annotate(
     device: str,
     id_column: str,
     text_column: str,
+    model_arch: str,
 ) -> Dict[str, List[Annotation]]:
     """Annotates text in `dataloader` through the `pipeline`.
 
@@ -309,7 +317,8 @@ def annotate(
         }
     """
 
-    pipeline.model.set_class_inds(dataloader.dataset.class_inds)
+    if model_arch == 'Demux':
+        pipeline.model.set_class_inds(dataloader.dataset.class_inds)
 
     confidences = {}
     confidence_fn = nn.Sigmoid()
@@ -323,7 +332,11 @@ def annotate(
         }
 
         with torch.no_grad():
-            out, _ = pipeline.model(**batch_inputs)
+            if model_arch == "Demux":
+                out, _ = pipeline.model(**batch_inputs)
+
+            else:
+                out = pipeline.model(**batch_inputs)
             scores = confidence_fn(out)
 
         for batch_id, batch_scores in zip(batch_ids, scores):
@@ -417,6 +430,9 @@ def parse_args():
         default="text",
         help="column name for text in csv/json",
     )
+    parser.add_argument(
+        "--model-architecture", default="base", help="name of model to use (either 'base' for basic BERT or 'Demux' for Demux)"
+    )
 
     return parser.parse_args()
 
@@ -441,6 +457,7 @@ def main():
         config["model_name"],
         os.path.join(args.pretrained_folder, "model.pt"),
         device,
+        args.model_architecture,
         args.domain,
     )
 
@@ -496,6 +513,7 @@ def main():
                         device,
                         args.id_column,
                         args.text_column,
+                        args.model_architecture
                     )
                 )
                 annotations.extend(new_annotations)
